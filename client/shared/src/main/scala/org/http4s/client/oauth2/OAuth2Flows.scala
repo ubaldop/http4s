@@ -10,9 +10,19 @@ import cats.syntax.all.*
 import org.http4s.headers.Authorization
 import cats.effect.syntax.all.*
 
+import java.time.Instant
+import scala.concurrent.duration.FiniteDuration
+
+case class RefreshTokenCredentials(clientId: String, clientSecret: String)
+
 object OAuth2Flows {
 
-  def clientCredentials[F[_]](authorizationServerUri: Uri, clientId: String, clientSecret: String)(
+  def clientCredentials[F[_]](
+      authorizationServerUri: Uri,
+      clientId: String,
+      clientSecret: String,
+      expirationFactor: Double = 0.8,
+  )(
       client: Client[F]
   )(implicit
       responseDecoder: EntityDecoder[F, AccessTokenResponse],
@@ -29,48 +39,57 @@ object OAuth2Flows {
 
     val response: F[AccessTokenResponse] = client.expect[AccessTokenResponse](request)
 
-    val validToken: F[Authorization] = for {
+    val validToken: F[(Option[FiniteDuration], Authorization)] = for {
       r <- response
       _ <- f.raiseWhen(r.tokenType != "bearer")(
         new Exception(s"unsupported token type, ${r.tokenType}")
       )
-    } yield Authorization(Credentials.Token(AuthScheme.Bearer, r.accessToken))
+    } yield (
+      r.expiresIn,
+      Authorization(Credentials.Token(AuthScheme.Bearer, r.accessToken)),
+    )
 
-    val authorizedClient: F[Client[F]] = for {
-      header <- validToken
-    } yield Client.apply { r: Request[F] =>
-      client.run(r.putHeaders(header))
-    }
+    def authorizedClient(authorization: Authorization): Client[F] =
+      Client.apply { r: Request[F] =>
+        client.run(r.putHeaders(authorization))
+      }
 
     def authorizedClientWithRef(ref: Ref[F, Authorization]): Client[F] =
       Client.apply { r: Request[F] =>
         for {
           header <- Resource.eval(ref.get)
-          result <-client.run(r.putHeaders(header))
+          result <- client.run(r.putHeaders(header))
         } yield result
-    }
+      }
 
-    def executeBackgroundTask(ref: Ref[F, Authorization]): F[Unit] = f.unit
-
-    val token: F[Ref[F, Authorization]] = validToken.flatMap(Ref[F].of(_))
-
-    val resource: Resource[F, (Fiber[F, Throwable, Unit], Client[F])] = {
-      Resource.make(token.flatMap {
-        authRef => {
-          executeBackgroundTask(authRef).start.map(
-            fiber => (fiber, authorizedClientWithRef(authRef))
-          )
-        }
-      }) {
-        case (fiber, _) => fiber.cancel
-    }
-    } //TODO finish it
+    def executeBackgroundTaskWithDuration(
+        expiresIn: FiniteDuration,
+        header: Ref[F, Authorization],
+    ): F[Unit] = for {
+      _ <- f.sleep(expiresIn * expirationFactor)
+      (updatedExpiresIn, authorization) <- validToken
+      _ <- header.set(authorization)
+      _ <- updatedExpiresIn match {
+        case Some(newExpiration) => executeBackgroundTaskWithDuration(newExpiration, header)
+        case None => f.unit
+      }
+    } yield ()
 
     for {
-      token <- Resource.eval(response)
-      x: Client[F] <- if (token.refreshToken.isDefined && token.expiresIn.isDefined) resource.map(_._2) else Resource.eval(authorizedClient)
-    } yield x
-
+      (expiresIn, header) <- Resource.eval(validToken)
+      client <- expiresIn match {
+        case Some(expIn) =>
+          Resource
+            .make(Ref[F].of(header).flatMap { r =>
+              executeBackgroundTaskWithDuration(expIn, r).start
+                .map(fiber => (fiber, authorizedClientWithRef(r)))
+            }) { case (fiber, _) =>
+              fiber.cancel
+            }
+            .map(_._2)
+        case None => Resource.pure[F, Client[F]](authorizedClient(header))
+      }
+    } yield client
   }
 
 }
